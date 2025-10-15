@@ -1,0 +1,109 @@
+# ============================================
+# 🐍 Python & Django 项目 .gitignore 模板
+# ============================================
+
+# --- Python 编译产物 ---
+__pycache__/
+*.py[cod]
+*$py.class
+
+# --- 虚拟环境 ---
+venv/
+env/
+.venv/
+.env/
+env.bak/
+Pipfile.lock
+poetry.lock
+
+# --- Django 运行文件 ---
+*.log
+*.pot
+*.pyc
+*.pyo
+*.sqlite3
+db.sqlite3
+*.py~ 
+*.mo
+.DS_Store
+
+# --- Django 特定目录 ---
+/staticfiles/
+/static_root/
+/media/
+/uploads/
+/collectstatic/
+/tmp/
+
+# --- Django migrations (可选忽略早期) ---
+# 一般建议保留 migrations，如果你还在开发阶段可以临时忽略
+# */migrations/*.py
+# !*/migrations/__init__.py
+
+# --- IDE 编辑器相关 ---
+.vscode/
+.idea/
+*.code-workspace
+
+# --- 系统文件 ---
+Thumbs.db
+.DS_Store
+ehthumbs.db
+Icon?
+desktop.ini
+
+# --- 编译/打包文件 ---
+build/
+dist/
+*.egg-info/
+.eggs/
+*.manifest
+*.spec
+
+# --- 测试缓存 ---
+.coverage
+.tox/
+.nox/
+.pytest_cache/
+htmlcov/
+
+# --- Jupyter / Notebook ---
+.ipynb_checkpoints/
+
+# --- 安全文件 ---
+*.key
+*.pem
+*.crt
+*.env
+.env.*
+secrets.json
+config.json
+
+# --- Docker ---
+Dockerfile~
+docker-compose.yml~
+*.dockerfile
+*.tar
+*.pid
+
+# --- 其他 ---
+# 如果你有前端目录
+node_modules/
+npm-debug.log
+yarn-debug.log
+yarn-error.log
+package-lock.json
+
+# --- VSCode & PyCharm 配置 ---
+.vscode/
+.idea/
+*.iml
+
+# --- Cache 相关 ---
+__pycache__/
+*.py[cod]
+.cache/
+*.egg
+*.egg-info/
+*.manifest
+*.spec
