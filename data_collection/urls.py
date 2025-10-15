@@ -13,6 +13,7 @@ router.register(r'kinematic-data', views.KinematicDataViewSet)
 router.register(r'imu-data', views.IMUDataViewSet)
 router.register(r'tactile-feedback', views.TactileFeedbackViewSet)
 router.register(r'files', views.FileUploadViewSet, basename='files')
+router.register(r'export', views.ExportViewSet, basename='export')
 
 urlpatterns = [
     path('api/', include(router.urls)),

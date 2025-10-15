@@ -107,3 +107,5 @@ __pycache__/
 *.egg-info/
 *.manifest
 *.spec
+
+/export_output/

@@ -12,6 +12,8 @@ import zipfile
 import threading
 import time
 import uuid
+import shutil
+import re
 from .models import (
     Collector, TaskInfo, Observations, Parameters, 
     SkeletonData, KinematicData, IMUData, TactileFeedback
@@ -509,6 +511,12 @@ class FileUploadViewSet(viewsets.ViewSet):
             
             print(f"[FileUpload] 解压完成: {extract_path}")
             
+            # 解压完成后：基于解压目录生成数据库记录并写入相对路径
+            try:
+                cls._generate_models_from_extracted_folder(extract_path)
+            except Exception as gen_e:
+                print(f"[FileUpload] 生成数据模型记录失败: {gen_e}")
+            
             # 删除压缩包
             try:
                 os.remove(zip_path)
@@ -535,6 +543,214 @@ class FileUploadViewSet(viewsets.ViewSet):
         
         finally:
             cls._running_extractions -= 1
+
+    @classmethod
+    def _generate_models_from_extracted_folder(cls, extract_path: str):
+        """从解压后的目录生成并保存各数据模型，更新TaskInfo外键链接。
+        目录命名: taskname_taskid_episode_id
+        子目录: IMU, kinematic, parameters, skeleton, Tactile, video
+        
+        说明:
+        - 仅在能找到对应的TaskInfo(优先episode_id)时写库；若找不到则跳过但打印告警。
+        - 写入路径均为相对settings.FILE_UPLOAD_DIR的相对路径。
+        - Observations.depth_path 暂为空。
+        """
+        base_upload_dir = getattr(settings, 'FILE_UPLOAD_DIR', 'uploads')
+        folder_name = os.path.basename(extract_path.rstrip(os.sep))
+        # 解析 task_name, task_id, episode_id
+        task_name, external_task_id, episode_id = cls._parse_folder_triplet(folder_name)
+        if not (task_name and external_task_id and episode_id):
+            print(f"[FileUpload] 警告: 目录名不符合规范, 跳过写库: {folder_name}")
+            return
+
+        # 查找TaskInfo(优先episode_id)，否则尝试按task_id取最近的一条
+        task = None
+        try:
+            task = TaskInfo.objects.get(episode_id=episode_id)
+        except TaskInfo.DoesNotExist:
+            tasks = TaskInfo.objects.filter(task_id=external_task_id).order_by('-id')
+            if tasks.exists():
+                task = tasks.first()
+        if task is None:
+            print(f"[FileUpload] 警告: 未找到TaskInfo(episode_id={episode_id}, task_id={external_task_id}), 跳过写库")
+            return
+
+        # 构建各子目录路径(大小写不敏感匹配)
+        subdirs = cls._map_existing_subdirs(extract_path, [
+            'IMU', 'kinematic', 'parameters', 'skeleton', 'Tactile', 'video'
+        ])
+
+        with transaction.atomic():
+            # Observations: video_path 取首个视频文件，depth_path 空
+            obs_id = None
+            video_file = cls._find_first_file_with_exts(subdirs.get('video'), ['.mp4', '.avi', '.mov', '.mkv'])
+            if video_file:
+                rel_video = cls._safe_relpath(video_file, base_upload_dir)
+                obs = Observations.objects.create(
+                    task_info=task,
+                    episode_id=task.episode_id,
+                    video_path=rel_video,
+                    depth_path=""
+                )
+                obs_id = obs.id
+
+            # Parameters: 取首个参数文件
+            params_id = None
+            params_file = cls._find_first_file_with_exts(subdirs.get('parameters'), ['.json', '.yaml', '.yml', '.txt'])
+            if params_file:
+                rel_params = cls._safe_relpath(params_file, base_upload_dir)
+                params = Parameters.objects.create(
+                    task_info=task,
+                    episode_id=task.episode_id,
+                    parameters_path=rel_params
+                )
+                params_id = params.id
+
+            # SkeletonData: 分别选取对应扩展名
+            skel_id = None
+            fbx = cls._find_first_file_with_exts(subdirs.get('skeleton'), ['.fbx'])
+            bvh = cls._find_first_file_with_exts(subdirs.get('skeleton'), ['.bvh'])
+            csv = cls._find_first_file_with_exts(subdirs.get('skeleton'), ['.csv'])
+            npy = cls._find_first_file_with_exts(subdirs.get('skeleton'), ['.npy'])
+            if any([fbx, bvh, csv, npy]):
+                skel = SkeletonData.objects.create(
+                    task_info=task,
+                    episode_id=task.episode_id,
+                    fbx_path=cls._safe_relpath(fbx, base_upload_dir) if fbx else "",
+                    bvh_path=cls._safe_relpath(bvh, base_upload_dir) if bvh else "",
+                    csv_path=cls._safe_relpath(csv, base_upload_dir) if csv else "",
+                    npy_path=cls._safe_relpath(npy, base_upload_dir) if npy else "",
+                )
+                skel_id = skel.id
+
+            # KinematicData: 记录目录本身(相对路径)
+            kine_id = None
+            if subdirs.get('kinematic') and os.path.isdir(subdirs['kinematic']):
+                rel_kine = cls._safe_relpath(subdirs['kinematic'], base_upload_dir)
+                kine = KinematicData.objects.create(
+                    task_info=task,
+                    episode_id=task.episode_id,
+                    path=rel_kine
+                )
+                kine_id = kine.id
+
+            # IMUData: left/right 优先匹配, 否则取前两个
+            imu_id = None
+            left_imu, right_imu = cls._pick_left_right_files(subdirs.get('IMU'))
+            if left_imu or right_imu:
+                imu = IMUData.objects.create(
+                    task_info=task,
+                    episode_id=task.episode_id,
+                    leftHandIMU_path=cls._safe_relpath(left_imu, base_upload_dir) if left_imu else "",
+                    rightHandIMU_path=cls._safe_relpath(right_imu, base_upload_dir) if right_imu else "",
+                )
+                imu_id = imu.id
+
+            # TactileFeedback: left/right 优先匹配
+            tac_id = None
+            left_tac, right_tac = cls._pick_left_right_files(subdirs.get('Tactile'))
+            if left_tac or right_tac:
+                tac = TactileFeedback.objects.create(
+                    task_info=task,
+                    episode_id=task.episode_id,
+                    leftHandTac_path=cls._safe_relpath(left_tac, base_upload_dir) if left_tac else "",
+                    rightHandTac_path=cls._safe_relpath(right_tac, base_upload_dir) if right_tac else "",
+                )
+                tac_id = tac.id
+
+            # 回填 TaskInfo 链接字段
+            updated = False
+            if obs_id is not None:
+                task.observations_id = obs_id; updated = True
+            if params_id is not None:
+                task.parameters_id = params_id; updated = True
+            if skel_id is not None:
+                task.skeletonData_id = skel_id; updated = True
+            if kine_id is not None:
+                task.kinematicData_id = kine_id; updated = True
+            if imu_id is not None:
+                task.imu_id = imu_id; updated = True
+            if tac_id is not None:
+                task.tactile_feedback_id = tac_id; updated = True
+            if updated:
+                task.save()
+
+    @staticmethod
+    def _parse_folder_triplet(folder_name: str):
+        parts = folder_name.split('_') if folder_name else []
+        if len(parts) >= 3:
+            # 只取最后两段作为task_id与episode_id，其余前缀合并为task_name
+            task_name = '_'.join(parts[:-2])
+            task_id = parts[-2]
+            episode_id = parts[-1]
+            return task_name, task_id, episode_id
+        return None, None, None
+
+    @staticmethod
+    def _safe_relpath(path: str, base_root: str):
+        if not path:
+            return ""
+        try:
+            # 使用os.path.relpath获取相对路径，然后统一使用正斜杠（URL兼容）
+            rel_path = os.path.relpath(path, base_root)
+            # 跨平台：将路径分隔符统一为正斜杠（适用于URL和跨平台）
+            return rel_path.replace(os.sep, '/')
+        except Exception:
+            # 如果计算相对路径失败，直接转换分隔符
+            return path.replace(os.sep, '/')
+
+    @staticmethod
+    def _map_existing_subdirs(root: str, names: list):
+        # 大小写不敏感匹配
+        result = {}
+        try:
+            entries = os.listdir(root)
+        except Exception:
+            entries = []
+        lower_to_real = {e.lower(): e for e in entries}
+        for n in names:
+            real = lower_to_real.get(n.lower())
+            if real:
+                result[n] = os.path.join(root, real)
+            else:
+                result[n] = None
+        return result
+
+    @staticmethod
+    def _find_first_file_with_exts(root: str, exts: list):
+        if not root or not os.path.isdir(root):
+            return None
+        exts_lower = [e.lower() for e in exts]
+        for dirpath, _, filenames in os.walk(root):
+            for fn in sorted(filenames):
+                if os.path.splitext(fn)[1].lower() in exts_lower:
+                    return os.path.join(dirpath, fn)
+        return None
+
+    @staticmethod
+    def _pick_left_right_files(root: str):
+        """在目录中挑选左右手文件，优先匹配文件名包含 left/right 或 L/R 关键字；否则取前两个文件。"""
+        if not root or not os.path.isdir(root):
+            return None, None
+        files = []
+        for dirpath, _, filenames in os.walk(root):
+            for fn in sorted(filenames):
+                files.append(os.path.join(dirpath, fn))
+        if not files:
+            return None, None
+        left = None
+        right = None
+        for f in files:
+            name = os.path.basename(f).lower()
+            if left is None and ('left' in name or name.startswith('l_') or name.endswith('_l')):
+                left = f
+            elif right is None and ('right' in name or name.startswith('r_') or name.endswith('_r')):
+                right = f
+        if left is None and len(files) >= 1:
+            left = files[0]
+        if right is None and len(files) >= 2:
+            right = files[1]
+        return left, right
     
     @action(detail=False, methods=['post'])
     def upload(self, request):
@@ -715,4 +931,304 @@ class FileUploadViewSet(viewsets.ViewSet):
             'queue_length': len(self._extraction_queue),
             'max_concurrent_extractions': self._max_concurrent_extractions,
             'upload_dir': getattr(settings, 'FILE_UPLOAD_DIR', 'uploads')
+        })
+
+
+class ExportViewSet(viewsets.ViewSet):
+    """数据导出API"""
+    
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._active_exports = {}
+        self._export_queue = []
+        self._running_exports = 0
+        self._max_concurrent_exports = 2
+    
+    @action(detail=False, methods=['post'])
+    def export_all(self, request):
+        """导出所有uploads下的数据到标准目录结构"""
+        try:
+            # 生成导出任务ID
+            export_id = f"export_{int(time.time())}_{uuid.uuid4().hex[:8]}"
+            
+            # 创建导出任务
+            export_task = {
+                'export_id': export_id,
+                'status': 'queued',
+                'progress': 0,
+                'message': '等待处理',
+                'created_at': datetime.now(),
+                'completed_at': None,
+                'error_message': '',
+                'export_path': '',
+                'file_count': 0
+            }
+            
+            self._active_exports[export_id] = export_task
+            self._export_queue.append(export_task)
+            
+            # 启动导出线程
+            export_thread = threading.Thread(target=self._execute_export, args=(export_task,))
+            export_thread.start()
+            
+            return Response({
+                'export_id': export_id,
+                'status': 'queued',
+                'message': '导出任务已创建'
+            })
+            
+        except Exception as e:
+            return Response({'error': str(e)}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+    
+    def _execute_export(self, export_task):
+        """执行导出任务"""
+        try:
+            export_task['status'] = 'preparing'
+            export_task['message'] = '准备导出...'
+            
+            # 生成导出目录名
+            timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+            export_dir_name = f"CMAvatar_data_{timestamp}"
+            
+            # 设置导出路径
+            base_dir = os.path.join(settings.BASE_DIR, 'export_output')
+            export_path = os.path.join(base_dir, export_dir_name)
+            
+            # 创建导出目录
+            os.makedirs(export_path, exist_ok=True)
+            export_task['export_path'] = export_path
+            
+            # 扫描uploads目录
+            uploads_dir = os.path.join(settings.BASE_DIR, 'uploads')
+            if not os.path.exists(uploads_dir):
+                raise Exception("uploads目录不存在")
+            
+            # 获取所有任务目录
+            task_dirs = [d for d in os.listdir(uploads_dir) 
+                        if os.path.isdir(os.path.join(uploads_dir, d)) and d != 'task_info']
+            
+            if not task_dirs:
+                raise Exception("没有找到任何任务数据")
+            
+            export_task['status'] = 'processing'
+            export_task['message'] = f'正在处理 {len(task_dirs)} 个任务...'
+            
+            total_files = 0
+            
+            # 处理每个任务目录
+            for i, task_dir in enumerate(task_dirs):
+                task_path = os.path.join(uploads_dir, task_dir)
+                
+                # 解析任务ID和episode ID
+                task_id, episode_id = self._parse_task_info(task_dir)
+                
+                # 创建目标目录结构
+                self._create_target_structure(export_path, task_id, episode_id)
+                
+                # 复制文件
+                files_copied = self._copy_task_files(task_path, export_path, task_id, episode_id)
+                total_files += files_copied
+                
+                # 更新进度
+                progress = int((i + 1) / len(task_dirs) * 100)
+                export_task['progress'] = progress
+                export_task['message'] = f'已处理 {i + 1}/{len(task_dirs)} 个任务'
+            
+            # 创建task_catalog.json
+            self._create_task_catalog(export_path, task_dirs)
+
+            # 生成 task_info JSON（模仿客户端导出结构）
+            try:
+                task_info_count = self._export_task_info_json(export_path)
+            except Exception as e:
+                task_info_count = 0
+                print(f"导出 task_info 失败: {e}")
+            
+            # 完成导出
+            export_task['status'] = 'completed'
+            export_task['progress'] = 100
+            export_task['message'] = f'导出完成，共处理 {total_files} 个文件；task_info: {task_info_count} 个'
+            export_task['file_count'] = total_files
+            export_task['completed_at'] = datetime.now()
+            
+        except Exception as e:
+            export_task['status'] = 'failed'
+            export_task['error_message'] = str(e)
+            export_task['completed_at'] = datetime.now()
+            print(f"导出失败: {e}")
+        
+        finally:
+            self._running_exports -= 1
+    
+    def _parse_task_info(self, task_dir_name):
+        """从目录名解析task_id和episode_id"""
+        # 格式: "Take toast from toaster_367_59"
+        # 提取最后的数字作为task_id和episode_id
+        parts = task_dir_name.split('_')
+        if len(parts) >= 2:
+            try:
+                task_id = parts[-2]
+                episode_id = parts[-1]
+                return task_id, episode_id
+            except (ValueError, IndexError):
+                pass
+        
+        # 如果解析失败，使用默认值
+        return "unknown", "unknown"
+    
+    def _create_target_structure(self, export_path, task_id, episode_id):
+        """创建目标目录结构"""
+        dirs_to_create = [
+            f"task_info",
+            f"observations/{task_id}/{episode_id}/videos",
+            f"observations/{task_id}/{episode_id}/depth",
+            f"parameters/{task_id}/{episode_id}/camera",
+            f"skeletonData/{task_id}/{episode_id}",
+            f"kinematicData/{task_id}/{episode_id}",
+            f"imu/{task_id}/{episode_id}",
+            f"tactileFeedback/{task_id}/{episode_id}",
+            f"tactile_feedback/{task_id}/{episode_id}"
+        ]
+        
+        for dir_path in dirs_to_create:
+            full_path = os.path.join(export_path, dir_path)
+            os.makedirs(full_path, exist_ok=True)
+    
+    def _copy_task_files(self, source_path, export_path, task_id, episode_id):
+        """复制任务文件到目标结构"""
+        files_copied = 0
+        
+        # 定义源目录到目标目录的映射
+        mappings = {
+            'parameters': f'parameters/{task_id}/{episode_id}',
+            'skeleton': f'skeletonData/{task_id}/{episode_id}',
+            'kinematic': f'kinematicData/{task_id}/{episode_id}',
+            'IMU': f'imu/{task_id}/{episode_id}',
+            'Tactile': f'tactileFeedback/{task_id}/{episode_id}',
+            'tactileFeedback': f'tactileFeedback/{task_id}/{episode_id}',
+            'tactile_feedback': f'tactile_feedback/{task_id}/{episode_id}',
+            'video': f'observations/{task_id}/{episode_id}/videos'
+        }
+        
+        # 复制各个目录
+        for source_dir, target_dir in mappings.items():
+            source_full_path = os.path.join(source_path, source_dir)
+            if os.path.exists(source_full_path):
+                target_full_path = os.path.join(export_path, target_dir)
+                files_copied += self._copy_directory(source_full_path, target_full_path)
+        
+        return files_copied
+    
+    def _copy_directory(self, source, target):
+        """复制目录及其内容"""
+        files_copied = 0
+        try:
+            if os.path.isdir(source):
+                shutil.copytree(source, target, dirs_exist_ok=True)
+                # 计算复制的文件数量
+                for root, dirs, files in os.walk(target):
+                    files_copied += len(files)
+        except Exception as e:
+            print(f"复制目录失败 {source} -> {target}: {e}")
+        
+        return files_copied
+    
+    def _create_task_catalog(self, export_path, task_dirs):
+        """创建task_catalog.json文件"""
+        catalog_path = os.path.join(export_path, 'task_catalog.json')
+        try:
+            with open(catalog_path, 'w', encoding='utf-8') as f:
+                f.write('{}')  # 空JSON对象
+        except Exception as e:
+            print(f"创建task_catalog.json失败: {e}")
+
+    def _export_task_info_json(self, export_path):
+        """将 TaskInfo 按业务 task_id 导出为 JSON 文件到 export_path/task_info 下。
+        结构参照客户端 ExportManager._export_task_info_data：
+        每个 task_id 一个 JSON 文件，数组元素包含 episode_id、label_info.action_config、task_name、init_scene_text。
+        """
+        import json
+
+        task_info_dir = os.path.join(export_path, 'task_info')
+        os.makedirs(task_info_dir, exist_ok=True)
+
+        # 收集所有 TaskInfo，按 task_id 分组
+        all_tasks = list(TaskInfo.objects.all().only('task_id', 'episode_id', 'task_name', 'init_scene_text', 'action_config'))
+        task_id_to_items = {}
+        for it in all_tasks:
+            biz_id = str(it.task_id or '')
+            if not biz_id:
+                continue
+            task_id_to_items.setdefault(biz_id, []).append(it)
+
+        exported_count = 0
+        for biz_id, items in task_id_to_items.items():
+            export_array = []
+            for it in items:
+                # episode_id 尽量转为 int，否则保留字符串
+                try:
+                    ep_val = int(it.episode_id)
+                except Exception:
+                    ep_val = str(it.episode_id)
+                export_array.append({
+                    'episode_id': ep_val,
+                    'label_info': {'action_config': it.action_config or []},
+                    'task_name': it.task_name or '',
+                    'init_scene_text': it.init_scene_text or ''
+                })
+
+            output_file = os.path.join(task_info_dir, f"{biz_id}.json")
+            try:
+                with open(output_file, 'w', encoding='utf-8') as f:
+                    json.dump(export_array, f, ensure_ascii=False, indent=2)
+                exported_count += 1
+            except Exception as e:
+                print(f"写入 task_info 文件失败 {output_file}: {e}")
+                continue
+
+        return exported_count
+    
+    @action(detail=False, methods=['get'])
+    def status(self, request):
+        """查询导出状态"""
+        export_id = request.query_params.get('export_id')
+        if not export_id:
+            return Response({'error': '缺少export_id参数'}, status=status.HTTP_400_BAD_REQUEST)
+        
+        if export_id not in self._active_exports:
+            return Response({'error': '导出任务不存在'}, status=status.HTTP_404_NOT_FOUND)
+        
+        task = self._active_exports[export_id]
+        return Response({
+            'export_id': task['export_id'],
+            'status': task['status'],
+            'progress': task['progress'],
+            'message': task['message'],
+            'error_message': task['error_message'],
+            'created_at': task['created_at'].isoformat(),
+            'completed_at': task['completed_at'].isoformat() if task['completed_at'] else None,
+            'export_path': task['export_path'],
+            'file_count': task['file_count']
+        })
+    
+    @action(detail=False, methods=['get'], url_path='list')
+    def list_exports(self, request):
+        """列出所有导出任务"""
+        tasks = []
+        for task in self._active_exports.values():
+            tasks.append({
+                'export_id': task['export_id'],
+                'status': task['status'],
+                'progress': task['progress'],
+                'message': task['message'],
+                'created_at': task['created_at'].isoformat(),
+                'completed_at': task['completed_at'].isoformat() if task['completed_at'] else None,
+                'file_count': task['file_count']
+            })
+        
+        return Response({
+            'exports': tasks,
+            'total': len(tasks),
+            'running': self._running_exports,
+            'queued': len(self._export_queue)
         })
