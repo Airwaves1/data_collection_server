@@ -6,6 +6,7 @@ from django.db import transaction
 from django.conf import settings
 from django.core.files.storage import default_storage
 from django.core.files.base import ContentFile
+from django.http import JsonResponse, HttpResponse
 from datetime import datetime
 import os
 import zipfile
@@ -937,12 +938,11 @@ class FileUploadViewSet(viewsets.ViewSet):
 class ExportViewSet(viewsets.ViewSet):
     """数据导出API"""
     
-    def __init__(self, *args, **kwargs):
-        super().__init__(*args, **kwargs)
-        self._active_exports = {}
-        self._export_queue = []
-        self._running_exports = 0
-        self._max_concurrent_exports = 2
+    # 类级别的共享状态
+    _active_exports = {}
+    _export_queue = []
+    _running_exports = 0
+    _max_concurrent_exports = 2
     
     @action(detail=False, methods=['post'])
     def export_all(self, request):
@@ -964,8 +964,8 @@ class ExportViewSet(viewsets.ViewSet):
                 'file_count': 0
             }
             
-            self._active_exports[export_id] = export_task
-            self._export_queue.append(export_task)
+            ExportViewSet._active_exports[export_id] = export_task
+            ExportViewSet._export_queue.append(export_task)
             
             # 启动导出线程
             export_thread = threading.Thread(target=self._execute_export, args=(export_task,))
@@ -996,7 +996,8 @@ class ExportViewSet(viewsets.ViewSet):
             
             # 创建导出目录
             os.makedirs(export_path, exist_ok=True)
-            export_task['export_path'] = export_path
+            # 使用绝对路径，确保跨平台兼容
+            export_task['export_path'] = os.path.abspath(export_path)
             
             # 扫描uploads目录
             uploads_dir = os.path.join(settings.BASE_DIR, 'uploads')
@@ -1058,7 +1059,7 @@ class ExportViewSet(viewsets.ViewSet):
             print(f"导出失败: {e}")
         
         finally:
-            self._running_exports -= 1
+            ExportViewSet._running_exports -= 1
     
     def _parse_task_info(self, task_dir_name):
         """从目录名解析task_id和episode_id"""
@@ -1188,17 +1189,17 @@ class ExportViewSet(viewsets.ViewSet):
 
         return exported_count
     
-    @action(detail=False, methods=['get'])
+    @action(detail=False, methods=['get'], url_path='status')
     def status(self, request):
         """查询导出状态"""
         export_id = request.query_params.get('export_id')
         if not export_id:
             return Response({'error': '缺少export_id参数'}, status=status.HTTP_400_BAD_REQUEST)
         
-        if export_id not in self._active_exports:
+        if export_id not in ExportViewSet._active_exports:
             return Response({'error': '导出任务不存在'}, status=status.HTTP_404_NOT_FOUND)
         
-        task = self._active_exports[export_id]
+        task = ExportViewSet._active_exports[export_id]
         return Response({
             'export_id': task['export_id'],
             'status': task['status'],
@@ -1215,7 +1216,7 @@ class ExportViewSet(viewsets.ViewSet):
     def list_exports(self, request):
         """列出所有导出任务"""
         tasks = []
-        for task in self._active_exports.values():
+        for task in ExportViewSet._active_exports.values():
             tasks.append({
                 'export_id': task['export_id'],
                 'status': task['status'],
@@ -1229,6 +1230,86 @@ class ExportViewSet(viewsets.ViewSet):
         return Response({
             'exports': tasks,
             'total': len(tasks),
-            'running': self._running_exports,
-            'queued': len(self._export_queue)
+            'running': ExportViewSet._running_exports,
+            'queued': len(ExportViewSet._export_queue)
         })
+    
+    @action(detail=False, methods=['get'], url_path='download_export')
+    def download_export(self, request):
+        """下载导出的数据 - 返回文件列表"""
+        export_path = request.query_params.get('export_path')
+        print(f"[DEBUG] 下载请求，路径: {export_path}")
+        
+        if not export_path:
+            return Response({'error': '缺少export_path参数'}, status=status.HTTP_400_BAD_REQUEST)
+        
+        print(f"[DEBUG] 检查路径是否存在: {export_path}")
+        print(f"[DEBUG] 路径存在: {os.path.exists(export_path)}")
+        
+        if not os.path.exists(export_path):
+            return Response({'error': f'导出路径不存在: {export_path}'}, status=status.HTTP_404_NOT_FOUND)
+        
+        try:
+            # 扫描所有文件
+            print(f"[DEBUG] 扫描文件列表")
+            files = []
+            for root, dirs, filenames in os.walk(export_path):
+                for filename in filenames:
+                    file_path = os.path.join(root, filename)
+                    rel_path = os.path.relpath(file_path, export_path)
+                    # 转换为正斜杠，确保跨平台兼容
+                    rel_path = rel_path.replace(os.sep, '/')
+                    files.append({
+                        'path': rel_path,
+                        'size': os.path.getsize(file_path)
+                    })
+            
+            print(f"[DEBUG] 找到 {len(files)} 个文件")
+            
+            return Response({
+                'files': files,
+                'total_files': len(files),
+                'export_path': export_path
+            })
+            
+        except Exception as e:
+            print(f"[DEBUG] 扫描文件失败: {e}")
+            return Response({'error': f'扫描文件失败: {e}'}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+    
+    @action(detail=False, methods=['get'], url_path='download_file')
+    def download_file(self, request):
+        """下载单个文件"""
+        export_path = request.query_params.get('export_path')
+        file_path = request.query_params.get('file_path')
+        
+        if not export_path or not file_path:
+            return JsonResponse({'error': '缺少参数'}, status=400)
+        
+        # 构建完整文件路径
+        full_path = os.path.join(export_path, file_path)
+        
+        if not os.path.exists(full_path):
+            return JsonResponse({'error': '文件不存在'}, status=404)
+        
+        try:
+            with open(full_path, 'rb') as f:
+                content = f.read()
+            
+            # 获取文件扩展名
+            _, ext = os.path.splitext(file_path)
+            content_type = 'application/octet-stream'
+            if ext.lower() in ['.json']:
+                content_type = 'application/json'
+            elif ext.lower() in ['.mp4', '.avi', '.mov']:
+                content_type = 'video/mp4'
+            elif ext.lower() in ['.txt']:
+                content_type = 'text/plain'
+            elif ext.lower() in ['.csv']:
+                content_type = 'text/csv'
+            
+            response = HttpResponse(content, content_type=content_type)
+            response['Content-Disposition'] = f'attachment; filename="{os.path.basename(file_path)}"'
+            return response
+            
+        except Exception as e:
+            return JsonResponse({'error': f'文件读取失败: {str(e)}'}, status=500)
