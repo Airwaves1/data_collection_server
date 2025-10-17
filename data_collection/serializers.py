@@ -108,8 +108,8 @@ class TaskInfoCreateSerializer(serializers.ModelSerializer):
     class Meta:
         model = TaskInfo
         fields = [
-            'collector', 'task_id', 'task_name', 'init_scene_text', 
-            'action_config', 'task_status', 'completed_at'
+            'collector', 'task_id', 'task_name', 'task_name_cn', 'init_scene_text', 
+            'action_config', 'task_status', 'completed_at', 'recording_end_time'
         ]
 
 

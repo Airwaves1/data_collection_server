@@ -42,6 +42,7 @@ class TaskInfo(models.Model):
     task_id = models.CharField(max_length=100, verbose_name="任务ID", default="", blank=True, db_index=True)
     episode_id = models.CharField(max_length=100, unique=True, verbose_name="Episode ID")
     task_name = models.CharField(max_length=200, verbose_name="任务名称")
+    task_name_cn = models.CharField(max_length=200, verbose_name="任务中文名称", blank=True, null=True)
     init_scene_text = models.TextField(blank=True, null=True, verbose_name="初始场景文本")
     action_config = models.JSONField(default=list, verbose_name="动作配置")
     task_status = models.CharField(max_length=20, choices=STATUS_CHOICES, default='pending', verbose_name="任务状态")
@@ -57,6 +58,7 @@ class TaskInfo(models.Model):
     
     created_at = models.DateTimeField(auto_now_add=True, verbose_name="创建时间")
     completed_at = models.DateTimeField(null=True, blank=True, verbose_name="完成时间")
+    recording_end_time = models.DateTimeField(null=True, blank=True, verbose_name="录制结束时间")
 
     class Meta:
         verbose_name = "任务信息"

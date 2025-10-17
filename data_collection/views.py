@@ -126,12 +126,60 @@ class TaskInfoViewSet(viewsets.ModelViewSet):
     
     @action(detail=False, methods=['get'])
     def by_collector(self, request):
-        """根据采集者ID获取任务列表 - 对应DBController.list_tasks_by_collector"""
+        """根据采集者ID获取任务列表 - 支持时间段筛选"""
         collector_id = request.query_params.get('collector_id')
         limit = int(request.query_params.get('limit', 100))
         offset = int(request.query_params.get('offset', 0))
         
-        tasks = TaskInfo.objects.filter(collector=collector_id)[offset:offset + limit]
+        # 获取时间范围参数
+        start_time = request.query_params.get('start_time')
+        end_time = request.query_params.get('end_time')
+        
+        # 构建查询
+        queryset = TaskInfo.objects.filter(collector=collector_id)
+        
+        # 如果有时间范围参数，添加时间筛选
+        if start_time and end_time:
+            try:
+                from datetime import datetime
+                import pytz
+                
+                # 解析时间字符串
+                start_dt = datetime.fromisoformat(start_time.replace('Z', '+00:00'))
+                end_dt = datetime.fromisoformat(end_time.replace('Z', '+00:00'))
+                
+                # 如果Django启用了时区支持，需要转换为UTC时区进行数据库查询
+                from django.utils import timezone
+                if timezone.is_aware(start_dt):
+                    # 已经是aware datetime，转换为UTC
+                    start_dt = start_dt.astimezone(pytz.UTC)
+                    end_dt = end_dt.astimezone(pytz.UTC)
+                else:
+                    # 假设输入的是本地时间，转换为UTC
+                    local_tz = timezone.get_current_timezone()
+                    start_dt = timezone.make_aware(start_dt, local_tz).astimezone(pytz.UTC)
+                    end_dt = timezone.make_aware(end_dt, local_tz).astimezone(pytz.UTC)
+                
+                # 使用created_at字段进行时间筛选（数据库存储的是UTC时间）
+                queryset = queryset.filter(created_at__gte=start_dt, created_at__lte=end_dt)
+                print(f"[DEBUG] 时间筛选: {start_dt} 到 {end_dt}")
+                
+                # 添加调试信息：查看数据库中的实际时间
+                sample_tasks = queryset[:5]  # 查看前5个任务的时间
+                for task in sample_tasks:
+                    print(f"[DEBUG] 数据库任务时间: {task.created_at} (ID: {task.id})")
+                
+                print(f"[DEBUG] 筛选前任务总数: {TaskInfo.objects.filter(collector=collector_id).count()}")
+                print(f"[DEBUG] 筛选后任务总数: {queryset.count()}")
+            except Exception as e:
+                print(f"[ERROR] 时间参数解析失败: {e}")
+                return Response({'error': 'Invalid time format'}, status=400)
+        
+        # 按创建时间倒序排列
+        queryset = queryset.order_by('-created_at')
+        
+        # 应用分页
+        tasks = queryset[offset:offset + limit]
         serializer = self.get_serializer(tasks, many=True)
         return Response(serializer.data)
     
