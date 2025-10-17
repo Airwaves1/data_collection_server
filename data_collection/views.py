@@ -293,6 +293,19 @@ class TaskInfoViewSet(viewsets.ModelViewSet):
         
         serializer = self.get_serializer(task)
         return Response(serializer.data)
+
+    @action(detail=True, methods=['patch'])
+    def set_exported(self, request, pk=None):
+        """根据主键任务设置exported状态（也支持以episode_id作为pk的用法）"""
+        exported = request.data.get('exported', True)
+        # 允许通过episode_id调用：优先按episode_id查找
+        task = TaskInfo.objects.filter(episode_id=str(pk)).first()
+        if task is None:
+            # 回退为默认的detail pk对象
+            task = self.get_object()
+        task.exported = bool(exported)
+        task.save(update_fields=['exported'])
+        return Response({'message': 'updated', 'id': task.id, 'episode_id': task.episode_id, 'exported': task.exported})
     
     @action(detail=False, methods=['patch'])
     def update_by_task_id(self, request):

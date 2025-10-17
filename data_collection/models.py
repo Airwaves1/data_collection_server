@@ -59,6 +59,7 @@ class TaskInfo(models.Model):
     created_at = models.DateTimeField(auto_now_add=True, verbose_name="创建时间")
     completed_at = models.DateTimeField(null=True, blank=True, verbose_name="完成时间")
     recording_end_time = models.DateTimeField(null=True, blank=True, verbose_name="录制结束时间")
+    exported = models.BooleanField(default=False, verbose_name="是否已导出")
 
     class Meta:
         verbose_name = "任务信息"
