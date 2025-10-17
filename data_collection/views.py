@@ -322,10 +322,38 @@ class TaskInfoViewSet(viewsets.ModelViewSet):
         task = tasks.first()
         
         # 更新字段
-        update_fields = ['task_name', 'init_scene_text', 'action_config', 'task_status']
+        update_fields = ['task_name', 'task_name_cn', 'init_scene_text', 'action_config', 'task_status', 'recording_end_time']
         for field in update_fields:
             if field in request.data:
-                setattr(task, field, request.data[field])
+                value = request.data[field]
+                # 特殊处理datetime字段
+                if field == 'recording_end_time' and isinstance(value, str):
+                    try:
+                        from datetime import datetime
+                        from django.utils import timezone
+                        import pytz
+                        
+                        # 解析ISO格式的datetime字符串
+                        if 'T' in value:
+                            # ISO格式: 2025-10-17T19:18:40.718359
+                            dt = datetime.fromisoformat(value.replace('Z', '+00:00'))
+                        else:
+                            # 简单格式: 2025-10-17 19:18:40.718359
+                            dt = datetime.fromisoformat(value)
+                        
+                        # 确保是aware datetime
+                        if not timezone.is_aware(dt):
+                            local_tz = timezone.get_current_timezone()
+                            dt = timezone.make_aware(dt, local_tz)
+                        
+                        # 转换为UTC存储
+                        value = dt.astimezone(pytz.UTC)
+                        print(f"[DEBUG] 解析recording_end_time: {request.data[field]} -> {value}")
+                    except Exception as e:
+                        print(f"[ERROR] 解析recording_end_time失败: {e}")
+                        continue
+                
+                setattr(task, field, value)
         
         task.save()
         
@@ -1237,14 +1265,90 @@ class ExportViewSet(viewsets.ViewSet):
         
         return files_copied
     
+    def _calculate_directory_size(self, directory_path):
+        """计算目录的总大小（字节）"""
+        total_size = 0
+        try:
+            for dirpath, dirnames, filenames in os.walk(directory_path):
+                for filename in filenames:
+                    file_path = os.path.join(dirpath, filename)
+                    try:
+                        total_size += os.path.getsize(file_path)
+                    except (OSError, IOError):
+                        # 忽略无法访问的文件
+                        continue
+        except Exception as e:
+            print(f"[WARN] 计算目录大小失败: {e}")
+        return total_size
+    
+    def _get_file_statistics(self, directory_path):
+        """获取目录的文件统计信息"""
+        file_count = 0
+        directory_count = 0
+        file_types = {}
+        
+        try:
+            for dirpath, dirnames, filenames in os.walk(directory_path):
+                directory_count += len(dirnames)
+                for filename in filenames:
+                    file_count += 1
+                    # 统计文件类型
+                    file_ext = os.path.splitext(filename)[1].lower()
+                    if file_ext:
+                        file_types[file_ext] = file_types.get(file_ext, 0) + 1
+                    else:
+                        file_types['no_extension'] = file_types.get('no_extension', 0) + 1
+        except Exception as e:
+            print(f"[WARN] 获取文件统计信息失败: {e}")
+        
+        return {
+            "file_count": file_count,
+            "directory_count": directory_count,
+            "file_types": file_types
+        }
+    
     def _create_task_catalog(self, export_path, task_dirs):
-        """创建task_catalog.json文件"""
+        """创建task_catalog.json文件，包含导出统计信息"""
         catalog_path = os.path.join(export_path, 'task_catalog.json')
         try:
+            # 计算导出目录的总大小
+            total_size = self._calculate_directory_size(export_path)
+            
+            # 统计任务信息
+            task_count = len(task_dirs)
+            
+            # 统计文件信息
+            file_stats = self._get_file_statistics(export_path)
+            
+            catalog_data = {
+                "export_info": {
+                    "export_time": datetime.now().isoformat(),
+                    "total_size_bytes": total_size,
+                    "total_size_mb": round(total_size / (1024 * 1024), 2),
+                    "total_size_gb": round(total_size / (1024 * 1024 * 1024), 3),
+                    "task_count": task_count,
+                    "file_count": file_stats["file_count"],
+                    "directory_count": file_stats["directory_count"]
+                },
+                "tasks": task_dirs,
+                "file_statistics": file_stats
+            }
+            
             with open(catalog_path, 'w', encoding='utf-8') as f:
-                f.write('{}')  # 空JSON对象
+                import json
+                json.dump(catalog_data, f, ensure_ascii=False, indent=2)
+                
+            print(f"[DEBUG] 创建task_catalog.json成功: {catalog_path}")
+            print(f"[DEBUG] 导出统计: {task_count}个任务, {file_stats['file_count']}个文件, 总大小: {round(total_size / (1024 * 1024), 2)}MB")
+            
         except Exception as e:
             print(f"创建task_catalog.json失败: {e}")
+            # 如果失败，至少创建一个空文件
+            try:
+                with open(catalog_path, 'w', encoding='utf-8') as f:
+                    f.write('{}')
+            except:
+                pass
 
     def _export_task_info_json(self, export_path):
         """将 TaskInfo 按业务 task_id 导出为 JSON 文件到 export_path/task_info 下。
