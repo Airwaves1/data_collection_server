@@ -17,14 +17,14 @@ import shutil
 import re
 from .models import (
     Collector, TaskInfo, Observations, Parameters, 
-    SkeletonData, KinematicData, IMUData, TactileFeedback
+    SkeletonData, KinematicData, IMUData, TactileFeedback, ObjectData
 )
 from .serializers import (
     CollectorSerializer, CollectorCreateUpdateSerializer, CollectorCreateSerializer, CollectorLoginSerializer,
     TaskInfoSerializer, TaskInfoCreateSerializer,
     ObservationsSerializer, ParametersSerializer,
     SkeletonDataSerializer, KinematicDataSerializer,
-    IMUDataSerializer, TactileFeedbackSerializer
+    IMUDataSerializer, TactileFeedbackSerializer, ObjectDataSerializer
 )
 
 
@@ -74,7 +74,7 @@ class CollectorViewSet(viewsets.ModelViewSet):
                 collector = Collector.objects.get(username=username, password=password)
                 return Response({
                     'message': '登录成功',
-                    'collector_id': collector.id,
+                    'collector_id': collector.id,  # 数据库自增ID，也是业务采集者ID
                     'username': collector.username,
                     'collector_name': collector.collector_name,
                     'collector_organization': collector.collector_organization
@@ -131,7 +131,7 @@ class TaskInfoViewSet(viewsets.ModelViewSet):
         limit = int(request.query_params.get('limit', 100))
         offset = int(request.query_params.get('offset', 0))
         
-        tasks = TaskInfo.objects.filter(collector_id=collector_id)[offset:offset + limit]
+        tasks = TaskInfo.objects.filter(collector=collector_id)[offset:offset + limit]
         serializer = self.get_serializer(tasks, many=True)
         return Response(serializer.data)
     
@@ -356,6 +356,19 @@ class TactileFeedbackViewSet(viewsets.ModelViewSet):
         return None
 
 
+class ObjectDataViewSet(viewsets.ModelViewSet):
+    """物体模型数据管理API"""
+    queryset = ObjectData.objects.all()
+    serializer_class = ObjectDataSerializer
+    
+    def create_object_data(self, data):
+        serializer = self.get_serializer(data=data)
+        if serializer.is_valid():
+            obj = serializer.save()
+            return obj.id
+        return None
+
+
 # 业务逻辑控制器 - 对应原DBController的功能
 class DataCollectionController:
     """数据采集业务控制器"""
@@ -415,7 +428,7 @@ class DataCollectionController:
     
     def list_tasks_by_collector(self, collector_id, limit=100, offset=0):
         """根据采集者ID获取任务列表"""
-        tasks = TaskInfo.objects.filter(collector_id=collector_id)[offset:offset + limit]
+        tasks = TaskInfo.objects.filter(collector=collector_id)[offset:offset + limit]
         serializer = TaskInfoSerializer(tasks, many=True)
         return serializer.data
     
@@ -578,7 +591,7 @@ class FileUploadViewSet(viewsets.ViewSet):
 
         # 构建各子目录路径(大小写不敏感匹配)
         subdirs = cls._map_existing_subdirs(extract_path, [
-            'IMU', 'kinematic', 'parameters', 'skeleton', 'Tactile', 'video'
+            'IMU', 'kinematic', 'parameters', 'skeleton', 'Tactile', 'video', 'object'
         ])
 
         with transaction.atomic():
@@ -673,6 +686,23 @@ class FileUploadViewSet(viewsets.ViewSet):
                 task.imu_id = imu_id; updated = True
             if tac_id is not None:
                 task.tactile_feedback_id = tac_id; updated = True
+            
+            # ObjectData: 记录 fbx/cmb 文件路径
+            obj_id = None
+            obj_dir = subdirs.get('object')
+            if obj_dir and os.path.isdir(obj_dir):
+                obj_fbx = cls._find_first_file_with_exts(obj_dir, ['.fbx'])
+                obj_cmb = cls._find_first_file_with_exts(obj_dir, ['.cmb'])
+                if obj_fbx or obj_cmb:
+                    obj = ObjectData.objects.create(
+                        task_info=task,
+                        episode_id=task.episode_id,
+                        fbx_path=cls._safe_relpath(obj_fbx, base_upload_dir) if obj_fbx else "",
+                        cmb_path=cls._safe_relpath(obj_cmb, base_upload_dir) if obj_cmb else "",
+                    )
+                    obj_id = obj.id
+            if obj_id is not None:
+                task.objectData_id = obj_id; updated = True
             if updated:
                 task.save()
 
@@ -1088,7 +1118,8 @@ class ExportViewSet(viewsets.ViewSet):
             f"kinematicData/{task_id}/{episode_id}",
             f"imu/{task_id}/{episode_id}",
             f"tactileFeedback/{task_id}/{episode_id}",
-            f"tactile_feedback/{task_id}/{episode_id}"
+            f"tactile_feedback/{task_id}/{episode_id}",
+            f"object/{task_id}/{episode_id}"
         ]
         
         for dir_path in dirs_to_create:
@@ -1108,17 +1139,28 @@ class ExportViewSet(viewsets.ViewSet):
             'Tactile': f'tactileFeedback/{task_id}/{episode_id}',
             'tactileFeedback': f'tactileFeedback/{task_id}/{episode_id}',
             'tactile_feedback': f'tactile_feedback/{task_id}/{episode_id}',
-            'video': f'observations/{task_id}/{episode_id}/videos'
+            'video': f'observations/{task_id}/{episode_id}/videos',
+            'object': f'object/{task_id}/{episode_id}'
         }
         
         # 复制各个目录
         for source_dir, target_dir in mappings.items():
-            source_full_path = os.path.join(source_path, source_dir)
-            if os.path.exists(source_full_path):
+            real_source_dir = self._find_subdir_case_insensitive(source_path, source_dir)
+            if real_source_dir:
+                source_full_path = os.path.join(source_path, real_source_dir)
                 target_full_path = os.path.join(export_path, target_dir)
                 files_copied += self._copy_directory(source_full_path, target_full_path)
         
         return files_copied
+
+    def _find_subdir_case_insensitive(self, root, name):
+        """在root下以不区分大小写的方式查找子目录名，返回实际存在的目录名或None"""
+        try:
+            entries = os.listdir(root)
+        except Exception:
+            return None
+        lookup = {e.lower(): e for e in entries}
+        return lookup.get(name.lower())
     
     def _copy_directory(self, source, target):
         """复制目录及其内容"""

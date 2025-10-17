@@ -1,7 +1,7 @@
 from rest_framework import serializers
 from .models import (
     Collector, TaskInfo, Observations, Parameters, 
-    SkeletonData, KinematicData, IMUData, TactileFeedback
+    SkeletonData, KinematicData, IMUData, TactileFeedback, ObjectData
 )
 
 
@@ -75,6 +75,14 @@ class TactileFeedbackSerializer(serializers.ModelSerializer):
         read_only_fields = ('created_at',)
 
 
+class ObjectDataSerializer(serializers.ModelSerializer):
+    """物体模型数据序列化器"""
+    class Meta:
+        model = ObjectData
+        fields = '__all__'
+        read_only_fields = ('created_at',)
+
+
 class TaskInfoSerializer(serializers.ModelSerializer):
     """任务信息序列化器"""
     collector_name = serializers.CharField(source='collector.collector_name', read_only=True)
@@ -87,6 +95,7 @@ class TaskInfoSerializer(serializers.ModelSerializer):
     kinematic_data = KinematicDataSerializer(read_only=True)
     imu_data = IMUDataSerializer(read_only=True)
     tactile_feedback = TactileFeedbackSerializer(read_only=True)
+    object_data = ObjectDataSerializer(read_only=True)
     
     class Meta:
         model = TaskInfo
